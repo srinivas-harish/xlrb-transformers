@@ -37,9 +37,9 @@ On late target layers, a learned **router** selects earlier source layers. Each 
 - **HDIM bridge:** a small MLP kernel computes nonlinear token–pair messages from source to target.
 
 Per-layer gates blend them:
-\[
-\boxed{\text{add\_ctx}=\alpha^{(j)}_{\text{attn}}\cdot \text{ctx}_{\text{qkv}}+\alpha^{(j)}_{\text{hdim}}\cdot \text{msg}_{\text{hdim}}}
-\]
+
+![Overview](docs/overview.png)
+
 
 This `add_ctx` is injected into the residual stream of the target layer, pre-FFN.
 
@@ -50,169 +50,38 @@ This `add_ctx` is injected into the residual stream of the target layer, pre-FFN
 | **HDIM bridge** | Nonlinear token-pair kernel via tiny MLPs | **More expressive** similarity/value fusion | Slightly higher compute; tune dims & gates |
 | **Hybrid (QKV+HDIM)** | Compute both; blend with learned per-layer gates | Lets model **pick per layer**; robust | If one path is useless, gates suppress it (watch usage) |
 
----# Mathematical Formulation
+# Mathematical Formulation
 
-We augment a depth-$L$ transformer (RoBERTa-large) with **cross-layer bridges**. Let:
-- $B$ = batch size, $S$ = sequence length, $H$ = hidden size,
-- $h$ = number of attention heads, $d_h = H/h$ (assumed integer),
-- $d_r$ = router projection size, $D$ = HDIM projection size.
 
-For each layer $j\in\{0,\dots,L-1\}$, denote its token states by
-
-$$
-H_j \in \mathbb{R}^{B\times S\times H}, \qquad H_j[b,s,:] = \text{hidden of token } s.
-$$
-
-Let $M\in\{0,1\}^{B\times S}$ be the (1=keep) attention mask; we use the standard **extended mask**
-
-$$
-\mathrm{ExtMask}(M) \in \mathbb{R}^{B\times 1\times 1\times S}, \quad
-\mathrm{ExtMask}(M)[b,1,1,t] =
-\begin{cases}
-0, & M[b,t]=1\\
--\infty, & M[b,t]=0.
-\end{cases}
-$$
-
-We only **route** on the last $N$ layers (e.g., $N=4$): $j \in \{L-N,\dots,L-1\}$, and allow sources $i<j$.
-
+![Formulation](docs/mathematical_formulation.png)
 ---
 
 ## 1. Routing (select source layers)
 
-Define a length-aware **pool** over tokens:
 
-$$
-\mathrm{pool}(H_j, M) =
-\begin{cases}
-\text{CLS}(H_j) = H_j[:,0,:] \in \mathbb{R}^{B\times H}, & \text{if CLS} \\
-\text{MaskedMean}(H_j,M) = \dfrac{\sum_{t} M[:,t]\, H_j[:,t,:]}{\sum_t M[:,t]} \in \mathbb{R}^{B\times H}, & \text{if mean.}
-\end{cases}
-$$
+![Routing](docs/routing.png)
 
-Project pooled summaries into a router space:
 
-$$
-q_j = W_q\, \mathrm{pool}(H_j,M) \in \mathbb{R}^{B\times d_r}, \qquad
-k_i = W_k\, \mathrm{pool}(H_i,M) \in \mathbb{R}^{B\times d_r}.
-$$
 
-Compute **routing logits** (temperature $\tau>0$):
-
-$$
-\ell_{ij} = \frac{\langle q_j, k_i\rangle}{\tau} \in \mathbb{R}^{B}.
-$$
-
-Let $\mathrm{TopK}_j \subset \{0,\dots,j-1\}$ be the $k$ source indices with largest $\ell_{ij}$ (per-batch). Define **mixing weights** by a masked softmax **restricted to** the selected sources:
-
-$$
-w_{ij} =
-\frac{\exp(\ell_{ij})\,\mathbf{1}[i\in \mathrm{TopK}_j]}{\sum_{u\in \mathrm{TopK}_j}\exp(\ell_{uj})}
-\quad\text{for } i<j.
-$$
-
-(For $k=1$, $w_{ij}$ is 1 at the top source and 0 elsewhere.)
 
 ---
 
 ## 2. QKV cross-layer message
 
-Let $\text{Attn}(Q,K,V,M)$ be standard scaled dot-product attention with mask $M$:
-
-$$
-\text{Attn}(Q,K,V,M) = \mathrm{softmax}\!\Big(\frac{QK^\top}{\sqrt{d_h}} + \mathrm{ExtMask}(M)\Big)\,V.
-$$
-
-Use **target queries** and **source keys/values**:
-
-$$
-Q_j = \mathrm{reshape\_heads}(H_j W_Q^{(j)}) \in \mathbb{R}^{B\times h\times S\times d_h},\quad
-K_i = \mathrm{reshape\_heads}(H_i W_K^{(i)}),\quad
-V_i = \mathrm{reshape\_heads}(H_i W_V^{(i)}).
-$$
-
-Per source $i\!\to\! j$:
-
-$$
-\mathrm{ctx}_{\text{qkv}}^{(i\to j)} = \mathrm{merge\_heads}\Big(\text{Attn}(Q_j,K_i,V_i,M)\Big) \in \mathbb{R}^{B\times S\times H}.
-$$
-
-Mix across the routed sources:
-
-$$
-\mathrm{ctx}_{\text{qkv}} = \sum_{i<j} w_{ij}\, \mathrm{ctx}_{\text{qkv}}^{(i\to j)} \;\;\in \mathbb{R}^{B\times S\times H}.
-$$
+![QKV Message](docs/qkv_message.png)
 
 ---
 
 ## 3. HDIM (higher-dimensional) message
 
-Per token, project to a compact space:
-
-$$
-Z_j = H_j P_j \in \mathbb{R}^{B\times S\times D},\qquad Z_i = H_i P_i \in \mathbb{R}^{B\times S\times D}.
-$$
-
-For each target token $s$ and source token $t$, build **pairwise features**
-
-$$
-\phi_{st} = \big[\, Z_j[s],\; Z_i[t],\; Z_j[s]\odot Z_i[t],\; |Z_j[s]-Z_i[t]| \,\big] \in \mathbb{R}^{4D}.
-$$
-
-A small MLP scorer $f_\theta:\mathbb{R}^{4D}\!\to\!\mathbb{R}$ produces **alignment logits**
-
-$$
-a_{st}^{(i\to j)} = f_\theta(\phi_{st}) \in \mathbb{R}.
-$$
-
-Apply a masked softmax over **source tokens** $t$:
-
-$$
-\alpha_{st}^{(i\to j)} = \frac{\exp\!\big(a_{st}^{(i\to j)} + \mathrm{MaskTok}(M,t)\big)}{\sum_{u}\exp\!\big(a_{su}^{(i\to j)} + \mathrm{MaskTok}(M,u)\big)}.
-$$
-
-Pool the source hidden states (in the **original** $H$ space):
-
-$$
-\mathrm{ctx}_i[s] = \sum_{t=1}^{S} \alpha_{st}^{(i\to j)}\, H_i[t] \in \mathbb{R}^{H}.
-$$
-
-Fuse with the target via a value MLP $g_\phi:\mathbb{R}^{3H}\!\to\!\mathbb{R}^{H}$:
-
-$$
-\mathrm{msg}_{\text{hdim}}^{(i\to j)}[s] = g_\phi\!\big(\,[\;\mathrm{ctx}_i[s],\; H_j[s],\; \mathrm{ctx}_i[s]\odot H_j[s]\;]\,\big).
-$$
-
-Mix across routed sources:
-
-$$
-\mathrm{msg}_{\text{hdim}} = \sum_{i<j} w_{ij}\, \mathrm{msg}_{\text{hdim}}^{(i\to j)} \;\;\in \mathbb{R}^{B\times S\times H}.
-$$
+![HDIM Message](docs/hdim_message.png)
 
 ---
 
 ## 4. Blending, normalization, and injection (pre-FFN)
 
-Let $A_j=\mathrm{SA}^{(j)}(H_j)$ denote the **post-attention output** at layer $j$.  
-Each routed layer $j$ learns scalar gates $\alpha^{(j)}_{\text{attn}},\alpha^{(j)}_{\text{hdim}}\in\mathbb{R}$ (initialized small, e.g., 0.15 and 0.05). Form:
 
-$$
-\mathrm{add\_ctx}_j = \alpha^{(j)}_{\text{attn}}\,\mathrm{ctx}_{\text{qkv}} \;+\; \alpha^{(j)}_{\text{hdim}}\,\mathrm{msg}_{\text{hdim}} \;\;\in \mathbb{R}^{B\times S\times H}.
-$$
-
-Apply per-layer LayerNorm and a near-zero linear projection (keeps init close to base model), then dropout:
-
-$$
-\widetilde{\mathrm{add\_ctx}}_j = \mathrm{Dropout}\!\big( W_{\text{proj}}^{(j)}(\mathrm{LN}^{(j)}(\mathrm{add\_ctx}_j)) \big).
-$$
-
-Inject **before** the FFN of layer $j$:
-
-$$
-H_j^{\text{preFFN}} = A_j + \widetilde{\mathrm{add\_ctx}}_j,\qquad
-H_{j+1}=\mathrm{FFN}^{(j)}(H_j^{\text{preFFN}}).
-$$
-
+![Blending](docs/blending.png)
 
 
 ---
@@ -366,4 +235,5 @@ Each script prints:
 - per-epoch train loss/EMA/acc  
 - validation accuracy/F1  
 - (hybrid metrics script) **live bridge usage**: QKV/HDIM norms, gate values, source histograms.
+
 
