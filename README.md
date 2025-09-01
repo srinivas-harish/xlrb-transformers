@@ -81,7 +81,7 @@ This `add_ctx` is injected into the residual stream of the target layer, pre-FFN
 ## 4. Blending, normalization, and injection (pre-FFN)
 
 
-![Blending](docs/blending.png)
+![Blending](docs/blending2.png)
 
 
 ---
@@ -235,5 +235,6 @@ Each script prints:
 - per-epoch train loss/EMA/acc  
 - validation accuracy/F1  
 - (hybrid metrics script) **live bridge usage**: QKV/HDIM norms, gate values, source histograms.
+
 
 
