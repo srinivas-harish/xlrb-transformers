@@ -1,4 +1,4 @@
-# Dynamic Inter-Layer Bridges for RoBERTa-Large (RTE)
+# Cross-Layer Routing Bridges (XLRB) for RoBERTa-Large
 
 This repo implements and evaluates **cross-layer communication mechanisms** on top of `roberta-large` for the GLUE RTE task. 
 We test two families of *bridges* — **QKV** (classical cross-attention across layers) and **HDIM** (higher-dimensional token–pair messages) — along with **hybrids** that combine both. 
@@ -235,6 +235,7 @@ Each script prints:
 - per-epoch train loss/EMA/acc  
 - validation accuracy/F1  
 - (hybrid metrics script) **live bridge usage**: QKV/HDIM norms, gate values, source histograms.
+
 
 
 
