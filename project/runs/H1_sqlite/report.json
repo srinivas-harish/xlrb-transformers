@@ -1,0 +1,74 @@
+{
+  "seed": 42,
+  "device": "cuda",
+  "cfg": {
+    "topk": 1,
+    "route_dim": 128,
+    "route_temp": 0.7,
+    "route_pool": "cls",
+    "route_last_n": 4,
+    "dropout": 0.1,
+    "inject_site": "pre_ffn",
+    "init_gate_attn": 0.15,
+    "init_gate_hdim": 0.05,
+    "hdim_proj_dim": 64,
+    "hdim_mlp_hidden": 128,
+    "hdim_pair_mode": "4term",
+    "hdim_val_mode": "concat_hadam",
+    "hdim_share_projections": false,
+    "hdim_use_proj_ln": false,
+    "hdim_val_residual": false,
+    "hdim_val_residual_scale": 0.1,
+    "hdim_token_temp": 1.0,
+    "ent_reg_weight": 0.0,
+    "enable_qkv": false,
+    "enable_hdim": true,
+    "qkv_target_weights": false,
+    "use_bridge_WV": false,
+    "inject_last_m": null,
+    "per_head_gates": false,
+    "adapter_hidden": 256
+  },
+  "param_counts": {
+    "total": 486040442,
+    "trainable": 486040442,
+    "approx_base": 0,
+    "approx_extra": 486040442
+  },
+  "best": {
+    "val_acc": 0.8050541516245487,
+    "epoch": 1
+  },
+  "epochs": [
+    {
+      "epoch": 1,
+      "time_sec": 64.84,
+      "train_acc": 0.6907630522088354,
+      "train_loss_ema": 0.5261599968339543,
+      "val_acc": 0.8050541516245487,
+      "val_f1_macro": 0.8049295774647888,
+      "lr": 0.0,
+      "gates": {
+        "alpha_attn": {
+          "shape": [
+            24
+          ],
+          "mean": 0.15000000596046448,
+          "std": 0.0,
+          "min": 0.15000000596046448,
+          "max": 0.15000000596046448
+        },
+        "alpha_hdim": {
+          "shape": [
+            24
+          ],
+          "mean": 0.04995555803179741,
+          "std": 0.00010081769141834229,
+          "min": 0.049644310027360916,
+          "max": 0.04999857768416405
+        }
+      }
+    }
+  ],
+  "save_dir": "runs/H1_sqlite"
+}

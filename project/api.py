@@ -1,75 +1,75 @@
-# FastAPI app + routes, imports celery_app + task from worker.py
-
 # api.py
-from typing import Any, Dict, Optional
-from fastapi import FastAPI
+import os
+from typing import Any, Dict, Optional, List
+
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
-from celery.result import AsyncResult
 
-from worker import celery_app, run_ablation_task
- 
+from db import (
+    init_db, get_session, create_run, set_task_id,
+    list_runs as db_list_runs, get_run_row, serialize_run,
+)
+from worker import run_ablation_task
 
-app = FastAPI(title="Ablation Service")
+app = FastAPI(title="Ablation API", version="0.2.0")
 
-@app.get("/")
-def root():
-    return {
-        "ok": True,
-        "service": "ablation",
-        "docs": "/docs",
-        "openapi": "/openapi.json"
-    }
+# ensure tables exist
+init_db()
 
-
-# ---- Pydantic models (API-facing) ----
-class EarlyStopSpec(BaseModel):
-    epoch1_val_below: float = Field(..., description="If val acc after epoch 1 is below this, stop early")
+class EarlyStop(BaseModel):
+    epoch1_val_below: Optional[float] = None
 
 class RunRequest(BaseModel):
-    ablation: Optional[str] = Field(None, description="Preset like A4_HDIM_only or H1_proj32_mlp128")
-    overrides: Dict[str, Any] = Field(default_factory=dict, description="Arbitrary knobs (BridgeCfg or train knobs)")
+    ablation: Optional[str] = None
+    overrides: Dict[str, Any] = Field(default_factory=dict)
     epochs: int = 3
     batch_size: int = 8
     max_len: int = 128
     save_dir: Optional[str] = None
     save_artifacts: bool = False
-    early_stop: Optional[EarlyStopSpec] = None
+    early_stop: Optional[EarlyStop] = None
     gradient_checkpointing: bool = True
-    device: Optional[str] = Field(None, description='"cpu" or "cuda" (auto if omitted)')
-    dataloader_workers: int | None = None  # <— NEW
+    device: Optional[str] = None
 
-class RunResponse(BaseModel):
-    task_id: str
+@app.get("/")
+def root():
+    return {"ok": True, "msg": "Ablation service ready", "endpoints": ["/runs (POST)", "/runs (GET)", "/runs/{run_id} (GET)"]}
 
-class StatusResponse(BaseModel):
-    status: str
-    meta: Optional[Dict[str, Any]] = None
+@app.post("/runs")
+def submit_run(req: RunRequest):
+    with get_session() as s:
+        run = create_run(
+            s,
+            ablation=req.ablation,
+            overrides=req.overrides,
+            epochs=req.epochs,
+            batch_size=req.batch_size,
+            max_len=req.max_len,
+            device=req.device or "auto",
+            save_dir=req.save_dir,
+            save_artifacts=req.save_artifacts,
+            early_stop=req.early_stop.model_dump() if req.early_stop else None,
+        )
+        run_id = run.id
 
-# ---- Routes ----
-@app.post("/run", response_model=RunResponse)
-def run_job(req: RunRequest):
-    payload = req.dict()
-    task = run_ablation_task.delay(payload)
-    return RunResponse(task_id=task.id)
+    # enqueue Celery task carrying the run_id and full request payload
+    async_result = run_ablation_task.delay(run_id, req.model_dump())
 
-@app.get("/status/{task_id}", response_model=StatusResponse)
-def get_status(task_id: str):
-    res = AsyncResult(task_id, app=celery_app)
-    if res.state == "PENDING":
-        return StatusResponse(status="PENDING")
-    if res.state == "STARTED":
-        return StatusResponse(status="STARTED", meta=res.info if isinstance(res.info, dict) else {"info": str(res.info)})
-    if res.state == "FAILURE":
-        return StatusResponse(status="FAILURE", meta={"error": str(res.result)})
-    if res.state == "SUCCESS":
-        return StatusResponse(status="SUCCESS", meta={"ready": True})
-    return StatusResponse(status=res.state)
+    with get_session() as s:
+        set_task_id(s, run_id, async_result.id)
 
-@app.get("/result/{task_id}")
-def get_result(task_id: str):
-    res = AsyncResult(task_id, app=celery_app)
-    if not res.ready():
-        return {"status": res.state}
-    if res.failed():
-        return {"status": "FAILURE", "error": str(res.result)}
-    return {"status": "SUCCESS", "result": res.result}
+    return {"run_id": run_id, "task_id": async_result.id, "status": "QUEUED"}
+
+@app.get("/runs")
+def list_runs(limit: int = Query(50, ge=1, le=500), status: Optional[str] = None):
+    with get_session() as s:
+        rows = db_list_runs(s, limit=limit, status=status)
+        return [serialize_run(r, with_children=False) for r in rows]
+
+@app.get("/runs/{run_id}")
+def get_run(run_id: str):
+    with get_session() as s:
+        row = get_run_row(s, run_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Run not found")
+        return serialize_run(row, with_children=True)
