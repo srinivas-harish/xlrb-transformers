@@ -1,0 +1,4 @@
+# Procfile.dev
+redis: redis-server --port ${REDIS_PORT:-6379}
+worker: bash -lc 'export IN_CELERY=1; export REDIS_URL=${REDIS_URL:-redis://localhost:${REDIS_PORT:-6379}/0}; celery -A worker.celery_app worker -P threads --concurrency=8 --loglevel=INFO'
+api:    bash -lc 'export REDIS_URL=${REDIS_URL:-redis://localhost:${REDIS_PORT:-6379}/0}; uvicorn api:app --reload --host 0.0.0.0 --port 8000'
