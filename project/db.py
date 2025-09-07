@@ -204,6 +204,17 @@ def serialize_run(run: Run, with_children: bool = False) -> Dict[str, Any]:
             }
             for e in run.epochs_rel
         ]
-        d["artifacts"] = [{"kind": a.kind, "path": a.path, "bytes": a.bytes} for a in run.artifacts]
+        d["artifacts"] = [
+            {
+                "id": str(a.id),
+                "kind": a.kind,
+                "path": a.path,
+                # Keep both for backward compatibility with older UIs
+                "bytes": a.bytes,
+                "size": a.bytes,
+                "created_at": a.created_at.isoformat() if a.created_at else None,
+            }
+            for a in run.artifacts
+        ]
         d["result"] = run.result_json
     return d

@@ -18,7 +18,7 @@ export default function RunForm({ onSubmitted }: { onSubmitted: (runId: string) 
   const [batchSize, setBatch] = useState(8)
   const [maxLen, setMaxLen] = useState(128)
   const [saveDir, setSaveDir] = useState<string>('')
-  const [saveArtifacts, setSaveArtifacts] = useState(true)
+  const [saveArtifacts, setSaveArtifacts] = useState(false)
   const [earlyStop, setEarlyStop] = useState<string>('0.0') // epoch1_val_below
   const [gradChkpt, setGradChkpt] = useState(true)
   const [device, setDevice] = useState<'auto'|'cuda'|'cpu'>('auto')
@@ -26,7 +26,8 @@ export default function RunForm({ onSubmitted }: { onSubmitted: (runId: string) 
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
-    const saved = localStorage.getItem('form_state')
+    // Use a new storage key to avoid older defaults (where saveArtifacts was true)
+    const saved = localStorage.getItem('form_state_v2')
     if (saved) {
       const s = JSON.parse(saved)
       setAblation(s.ablation ?? '')
@@ -35,7 +36,8 @@ export default function RunForm({ onSubmitted }: { onSubmitted: (runId: string) 
       setBatch(s.batchSize ?? 8)
       setMaxLen(s.maxLen ?? 128)
       setSaveDir(s.saveDir ?? '')
-      setSaveArtifacts(s.saveArtifacts ?? true)
+      // Default remains unchecked unless explicitly saved as true in v2
+      setSaveArtifacts(Boolean(s.saveArtifacts))
       setEarlyStop(String(s.earlyStop ?? '0.0'))
       setGradChkpt(s.gradChkpt ?? true)
       setDevice(s.device ?? 'auto')
@@ -60,7 +62,7 @@ export default function RunForm({ onSubmitted }: { onSubmitted: (runId: string) 
     setError(null)
     setSubmitting(true)
     try {
-      localStorage.setItem('form_state', JSON.stringify({
+      localStorage.setItem('form_state_v2', JSON.stringify({
         ablation, overrides, epochs, batchSize, maxLen, saveDir, saveArtifacts, earlyStop, gradChkpt, device
       }))
       const res = await createRun(payload)

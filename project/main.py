@@ -27,7 +27,7 @@
 #   GET  /result/{task_id}
 
 # main.py
-import os, math, time, random, numpy as np
+import os, math, time, random, numpy as np, json
 from dataclasses import dataclass, asdict, replace
 from typing import Dict, Optional, List, Any
 
@@ -69,6 +69,24 @@ def effective_num_workers(requested: int | None) -> int:
     if os.environ.get("IN_CELERY", "0") == "1":
         return 0
     return 0 if requested is None else max(0, int(requested))
+
+# ---------------- NVTX helper ----------------
+class nvtx_range:
+    def __init__(self, name: str, enabled: bool):
+        self.name = name
+        self.enabled = enabled and torch.cuda.is_available()
+    def __enter__(self):
+        if self.enabled:
+            try:
+                torch.cuda.nvtx.range_push(self.name)
+            except Exception:
+                pass
+    def __exit__(self, exc_type, exc, tb):
+        if self.enabled:
+            try:
+                torch.cuda.nvtx.range_pop()
+            except Exception:
+                pass
 # ---------------- Config (superset of your knobs) ----------------
 @dataclass
 class BridgeCfg:
@@ -495,6 +513,8 @@ def train_and_eval(
     save_artifacts: bool = False,
     early_stop: Optional[Dict[str, float]] = None,
     gradient_checkpointing: bool = True,
+    max_train_batches: Optional[int] = None,
+    progress_path: Optional[str] = None,
 ) -> Dict[str, Any]:
 
     set_all_seeds(GLOBAL_SEED)
@@ -524,28 +544,42 @@ def train_and_eval(
 
     for epoch in range(1, epochs + 1):
         model.train(); start = time.time(); ema_loss = None; correct = 0; seen = 0
-        for batch in tqdm(train_loader, total=len(train_loader), desc=f"Epoch {epoch}/{epochs}", dynamic_ncols=True, leave=False):
-            batch = {k: v.to(device) for k, v in batch.items()}
-            optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast('cuda', enabled=(device.type == "cuda")):
-                out = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
-                loss = ce_loss(out.logits, batch["labels"])
-                if cfg.ent_reg_weight > 0.0:
-                    regs = [m._ent_reg for m in model.encoder.hdim_by_tgt if getattr(m, "_ent_reg", None) is not None]
-                    if regs: loss = loss + cfg.ent_reg_weight * torch.stack(regs).mean()
-            preds = out.logits.argmax(-1); correct += (preds == batch["labels"]).sum().item(); seen += len(preds)
-            loss_val = float(loss.item()); ema_loss = loss_val if ema_loss is None else 0.9*ema_loss + 0.1*loss_val
-            scaler.scale(loss).backward(); scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-            scaler.step(optimizer); scaler.update(); scheduler.step()
+        with nvtx_range(f"epoch_{epoch}", enabled=(device.type == "cuda")):
+            for ib, batch in enumerate(tqdm(train_loader, total=len(train_loader), desc=f"Epoch {epoch}/{epochs}", dynamic_ncols=True, leave=False)):
+                batch = {k: v.to(device) for k, v in batch.items()}
+                optimizer.zero_grad(set_to_none=True)
+                with nvtx_range("forward", enabled=(device.type == "cuda")):
+                    with torch.amp.autocast('cuda', enabled=(device.type == "cuda")):
+                        out = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
+                        loss = ce_loss(out.logits, batch["labels"])
+                        if cfg.ent_reg_weight > 0.0:
+                            regs = [m._ent_reg for m in model.encoder.hdim_by_tgt if getattr(m, "_ent_reg", None) is not None]
+                            if regs: loss = loss + cfg.ent_reg_weight * torch.stack(regs).mean()
+                preds = out.logits.argmax(-1); correct += (preds == batch["labels"]).sum().item(); seen += len(preds)
+                loss_val = float(loss.item()); ema_loss = loss_val if ema_loss is None else 0.9*ema_loss + 0.1*loss_val
+                with nvtx_range("backward+step", enabled=(device.type == "cuda")):
+                    scaler.scale(loss).backward(); scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                    scaler.step(optimizer); scaler.update(); scheduler.step()
+                if max_train_batches is not None and (ib + 1) >= max_train_batches:
+                    break
 
         train_acc_epoch = correct / max(1, seen)
         val_metrics = evaluate(device, model, val_loader)
         gates = gate_summaries(model.encoder)
-        logs.append({"epoch": epoch, "time_sec": round(time.time()-start,2),
-                     "train_acc": float(train_acc_epoch), "train_loss_ema": float(ema_loss) if ema_loss is not None else None,
-                     "val_acc": float(val_metrics["accuracy"]), "val_f1_macro": float(val_metrics["f1_macro"]),
-                     "lr": float(optimizer.param_groups[0]["lr"]), "gates": gates})
+        ep_row = {"epoch": epoch, "time_sec": round(time.time()-start,2),
+                  "train_acc": float(train_acc_epoch), "train_loss_ema": float(ema_loss) if ema_loss is not None else None,
+                  "val_acc": float(val_metrics["accuracy"]), "val_f1_macro": float(val_metrics["f1_macro"]),
+                  "lr": float(optimizer.param_groups[0]["lr"]), "gates": gates}
+        logs.append(ep_row)
+
+        # Optional: write incremental progress for external tailing
+        if progress_path:
+            try:
+                with open(progress_path, "a") as pf:
+                    pf.write(json.dumps(ep_row) + "\n")
+            except Exception:
+                pass
 
         if task_ctx is not None:
             task_ctx.update_state(state="STARTED", meta={"progress_epoch": epoch, "epochs_total": epochs, "last_val": val_metrics})

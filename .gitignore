@@ -2,3 +2,47 @@ tests
 .venv
 ablation_scripts/run_mnli_test.py
 project/runs
+
+
+# Python bytecode/cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual envs (if present)
+.venv/
+venv/
+env/
+
+# Local env files
+.env
+
+# Databases
+project/db.sqlite
+*.sqlite*
+*.db
+
+# Redis dump
+dump.rdb
+project/dump.rdb
+
+# NVIDIA / profiler error dumps at repo root
+.stats.*.err
+
+# Logs
+*.log
+
+# Node/React build artifacts
+node_modules/
+frontend/node_modules/
+frontend/build/
+frontend/dist/
+frontend/.next/
+frontend/.turbo/
+frontend/.cache/
+*.tsbuildinfo
+
+# OS junk
+.DS_Store
+Thumbs.db

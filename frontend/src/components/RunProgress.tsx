@@ -74,6 +74,12 @@ export default function RunProgress({ runId, run }: { runId: string; run?: RunDe
         <MetricCard label="Device" value={data?.device ?? 'auto'} />
       </div>
 
+      {((data?.status === 'RUNNING' || data?.status === 'STARTED') && (epochsDone === 0)) && (
+        <div className="mt-2 text-xs text-zinc-400">
+          First epoch in progress — per-epoch metrics log at the end of each epoch.
+        </div>
+      )}
+
       <div className="grid md:grid-cols-2 gap-4 mt-4">
         <ChartLine data={accData} xKey="epoch" yKey="val_acc" y2Key="train_acc" yLabel="accuracy" />
         <ChartLine

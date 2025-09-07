@@ -11,6 +11,8 @@ from db import (
     list_runs as db_list_runs, get_run_row, serialize_run,
 )
 from worker import run_ablation_task
+from profiling import parse_nsys_sqlite, export_nsys_stats, parse_nsys_csvs
+import glob, json, os
 
 app = FastAPI(title="Ablation API", version="0.2.0")
 
@@ -88,3 +90,80 @@ def get_run(run_id: str):
         if not row:
             raise HTTPException(status_code=404, detail="Run not found")
         return serialize_run(row, with_children=True)
+
+
+@app.post("/runs/{run_id}/refresh_profiling")
+def refresh_profiling(run_id: str):
+    """
+    Best-effort backfill of profiling summary/details for an existing run by
+    parsing the saved Nsight artifacts (sqlite or rep).
+    """
+    with get_session() as s:
+        row = get_run_row(s, run_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Run not found")
+        result = (row.result_json or {})
+        profiling = result.setdefault("profiling", {})
+
+        # Try to find a sqlite timeline in artifacts or save_dir
+        sqlite_paths: list[str] = []
+        for a in (row.artifacts or []):
+            p = a.path or ""
+            if p.endswith(".sqlite") and os.path.exists(p):
+                sqlite_paths.append(p)
+        # fallback: search in save_dir/nsys
+        if not sqlite_paths and row.save_dir:
+            sqlite_paths.extend(glob.glob(os.path.join(row.save_dir, "nsys", "*.sqlite")))
+
+        summary = None
+        details = None
+        # First try sqlite parser
+        for sp in sqlite_paths:
+            try:
+                parsed = parse_nsys_sqlite(sp)
+                if parsed:
+                    summary_keys = {
+                        "gpu_busy_pct", "total_gpu_time_ms", "memcpy_time_ms", "memset_time_ms",
+                        "transfer_overhead_pct", "num_unique_kernels"
+                    }
+                    summary = {k: v for k, v in parsed.items() if k in summary_keys}
+                    details = {k: v for k, v in parsed.items() if k not in summary_keys}
+                    break
+            except Exception:
+                continue
+        # If still nothing, attempt CSV export if a rep exists
+        if not summary:
+            rep_paths: list[str] = []
+            for a in (row.artifacts or []):
+                p = a.path or ""
+                if (p.endswith(".qdrep") or p.endswith(".nsys-rep")) and os.path.exists(p):
+                    rep_paths.append(p)
+            for rp in rep_paths:
+                try:
+                    outb = os.path.splitext(rp)[0] + ".stats.refresh"
+                    stats = export_nsys_stats(rp, outb)
+                    if stats.get("csv"):
+                        parsed = parse_nsys_csvs(stats["csv"]) or {}
+                        if parsed:
+                            summary_keys = {
+                                "gpu_busy_pct", "total_gpu_time_ms", "memcpy_time_ms", "memset_time_ms",
+                                "transfer_overhead_pct", "num_unique_kernels"
+                            }
+                            summary = {k: v for k, v in parsed.items() if k in summary_keys}
+                            details = {k: v for k, v in parsed.items() if k not in summary_keys}
+                            break
+                except Exception:
+                    continue
+
+        if not (summary or details):
+            raise HTTPException(status_code=422, detail="No Nsight artifacts could be parsed")
+
+        if summary:
+            profiling["nsys_summary"] = summary
+        if details:
+            profiling["nsys_details"] = details
+
+        # Persist back into DB
+        row.result_json = result
+
+        return {"ok": True, "profiling": profiling}

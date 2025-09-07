@@ -22,6 +22,21 @@ export type ResultBlob = {
   best: { val_acc: number; epoch: number }
   epochs: EpochLog[]
   save_dir?: string | null
+  profiling?: {
+    nsys_summary?: {
+      gpu_busy_pct?: number | null
+      total_gpu_time_ms?: number | null
+      memcpy_time_ms?: number | null
+      memset_time_ms?: number | null
+      transfer_overhead_pct?: number | null
+      num_unique_kernels?: number | null
+    }
+    nsys_details?: {
+      kernels?: Array<{ name: string; calls?: number | null; time_ms?: number | null; avg_ms?: number | null; pct_gpu_time?: number | null }>
+      cuda_api?: Array<{ name: string; calls?: number | null; time_ms?: number | null; avg_ms?: number | null }>
+      transfers?: Array<{ name: string; calls?: number | null; time_ms?: number | null }>
+    }
+  }
 }
 
 export type RunRow = {
