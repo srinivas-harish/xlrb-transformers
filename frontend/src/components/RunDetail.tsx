@@ -1,10 +1,20 @@
 import type { RunDetail as RunDetailT } from '../lib/types'
 import MetricCard from './MetricCard'
 import ChartLine from './ChartLine'
+import EpochsTable from './EpochsTable'
 
 export default function RunDetail({ data }: { data: RunDetailT }) {
   const cfg = data.result?.cfg
   const epochs = data.result?.epochs || []
+  const download = (obj: any, name: string) => {
+    const blob = new Blob([JSON.stringify(obj, null, 2)], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = name
+    a.click()
+    URL.revokeObjectURL(url)
+  }
 
   return (
     <div className="space-y-6">
@@ -29,17 +39,28 @@ export default function RunDetail({ data }: { data: RunDetailT }) {
 
       <div className="grid md:grid-cols-2 gap-4">
         <div className="bg-zinc-900 border border-zinc-800 rounded-lg p-4">
-          <div className="text-sm font-semibold mb-2">Overrides</div>
+          <div className="flex items-center justify-between mb-2">
+            <div className="text-sm font-semibold">Overrides</div>
+            <button className="text-xs px-2 py-1 rounded bg-zinc-800 hover:bg-zinc-700" onClick={() => download(data.overrides ?? {}, `overrides-${data.id}.json`)}>Download</button>
+          </div>
           <pre className="text-xs overflow-auto bg-zinc-950 p-3 rounded border border-zinc-800">
             {JSON.stringify(data.overrides ?? {}, null, 2)}
           </pre>
         </div>
         <div className="bg-zinc-900 border border-zinc-800 rounded-lg p-4">
-          <div className="text-sm font-semibold mb-2">BridgeCfg (effective)</div>
+          <div className="flex items-center justify-between mb-2">
+            <div className="text-sm font-semibold">BridgeCfg (effective)</div>
+            <button className="text-xs px-2 py-1 rounded bg-zinc-800 hover:bg-zinc-700" onClick={() => download(cfg ?? {}, `cfg-${data.id}.json`)}>Download</button>
+          </div>
           <pre className="text-xs overflow-auto bg-zinc-950 p-3 rounded border border-zinc-800">
             {JSON.stringify(cfg ?? {}, null, 2)}
           </pre>
         </div>
+      </div>
+
+      <div>
+        <div className="text-sm font-semibold mb-2">Epoch Breakdown</div>
+        <EpochsTable data={data} />
       </div>
 
       <div className="bg-zinc-900 border border-zinc-800 rounded-lg p-4">

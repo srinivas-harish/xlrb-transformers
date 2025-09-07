@@ -26,6 +26,9 @@ export default function RunProgress({ runId, run }: { runId: string; run?: RunDe
   const progress = epochsRequested ? epochsDone / epochsRequested : 0
   const last = data?.epochs_rows?.[data.epochs_rows.length - 1]
   const lastVal = last?.val_acc ?? data?.result?.best?.val_acc
+  const avgPerEpoch = last?.time_sec && last?.epoch ? (last.time_sec / last.epoch) : undefined
+  const remaining = epochsRequested - epochsDone
+  const etaSec = avgPerEpoch && remaining > 0 ? avgPerEpoch * remaining : undefined
 
   const accData = useMemo(() => (data?.epochs_rows || []).map(e => ({
     epoch: e.epoch, val_acc: e.val_acc, train_acc: e.train_acc
@@ -43,7 +46,7 @@ export default function RunProgress({ runId, run }: { runId: string; run?: RunDe
             'px-2 py-1 rounded text-xs font-bold',
             data?.status === 'COMPLETE' ? 'bg-emerald-700' :
             data?.status === 'FAILED' ? 'bg-red-700' :
-            data?.status === 'STARTED' ? 'bg-amber-700' : 'bg-zinc-700'
+            (data?.status === 'RUNNING' || data?.status === 'STARTED') ? 'bg-amber-700' : 'bg-zinc-700'
           )}>
             {data?.status ?? '…'}
           </span>
@@ -56,7 +59,10 @@ export default function RunProgress({ runId, run }: { runId: string; run?: RunDe
         </div>
         <div className="flex justify-between mt-1 text-xs text-zinc-400">
           <div>{epochsDone} / {epochsRequested} epochs</div>
-          <div>val_acc: {lastVal?.toFixed?.(4) ?? '—'}</div>
+          <div className="flex gap-3">
+            <span>val_acc: {lastVal?.toFixed?.(4) ?? '—'}</span>
+            {etaSec && <span>ETA ~{Math.max(1, Math.round(etaSec))}s</span>}
+          </div>
         </div>
       </div>
 
@@ -76,6 +82,23 @@ export default function RunProgress({ runId, run }: { runId: string; run?: RunDe
           }))}
           xKey="epoch" yKey="alpha_hdim_mean" yLabel="α_hdim mean"
         />
+      </div>
+      <div className="grid md:grid-cols-2 gap-4 mt-4">
+        <ChartLine
+          data={(data?.result?.epochs || []).map((e) => ({
+            epoch: e.epoch, alpha_attn_mean: e.gates?.alpha_attn?.mean
+          }))}
+          xKey="epoch" yKey="alpha_attn_mean" yLabel="α_attn mean"
+        />
+        <div className="bg-zinc-900 border border-zinc-800 rounded-lg p-4">
+          <div className="text-sm font-semibold mb-2">Run Config</div>
+          <div className="grid grid-cols-2 gap-2 text-sm">
+            <div className="text-zinc-400">Ablation</div><div>{data?.ablation ?? '(custom)'}</div>
+            <div className="text-zinc-400">Device</div><div>{data?.device ?? 'auto'}</div>
+            <div className="text-zinc-400">Batch</div><div>{data?.batch_size ?? '—'}</div>
+            <div className="text-zinc-400">Max len</div><div>{data?.max_len ?? '—'}</div>
+          </div>
+        </div>
       </div>
     </div>
   )

@@ -3,6 +3,7 @@ import os
 from typing import Any, Dict, Optional, List
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from db import (
@@ -12,6 +13,20 @@ from db import (
 from worker import run_ablation_task
 
 app = FastAPI(title="Ablation API", version="0.2.0")
+
+# CORS for local frontend dev (Vite on 5173)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173", "http://127.0.0.1:5173",
+        "http://localhost:5174", "http://127.0.0.1:5174",
+        "http://localhost:5175", "http://127.0.0.1:5175",
+        "http://0.0.0.0:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ensure tables exist
 init_db()

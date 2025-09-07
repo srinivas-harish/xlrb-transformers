@@ -1,4 +1,4 @@
-export type RunStatus = 'QUEUED'|'STARTED'|'COMPLETE'|'FAILED'
+export type RunStatus = 'QUEUED'|'RUNNING'|'COMPLETE'|'FAILED'|'STARTED'
 
 export type EpochLog = {
   epoch: number

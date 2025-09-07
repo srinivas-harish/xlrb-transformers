@@ -3,6 +3,7 @@ import RunForm from './components/RunForm'
 import RunList from './components/RunList'
 import RunDetail from './components/RunDetail'
 import RunProgress from './components/RunProgress'
+import StatusBoard from './components/StatusBoard'
 import { getRun } from './lib/api'
 import type { RunDetail as RunDetailT } from './lib/types'
 import { clsx } from 'clsx'
@@ -71,13 +72,22 @@ export default function App() {
       )}
 
       {tab === 'runs' && (
-        <RunList
-          onOpen={(id) => {
-            localStorage.setItem('last_run_id', id)
-            setSelectedId(id)
-            setTab('detail')
-          }}
-        />
+        <div className="space-y-6">
+          <StatusBoard
+            onOpen={(id) => {
+              localStorage.setItem('last_run_id', id)
+              setSelectedId(id)
+              setTab('detail')
+            }}
+          />
+          <RunList
+            onOpen={(id) => {
+              localStorage.setItem('last_run_id', id)
+              setSelectedId(id)
+              setTab('detail')
+            }}
+          />
+        </div>
       )}
 
       {tab === 'detail' && selectedId && (
