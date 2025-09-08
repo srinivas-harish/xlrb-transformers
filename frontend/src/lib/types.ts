@@ -36,6 +36,7 @@ export type ResultBlob = {
       cuda_api?: Array<{ name: string; calls?: number | null; time_ms?: number | null; avg_ms?: number | null }>
       transfers?: Array<{ name: string; calls?: number | null; time_ms?: number | null }>
     }
+    debug?: Record<string, any>
   }
 }
 
@@ -69,4 +70,21 @@ export type RunDetail = RunRow & {
   }>
   artifacts?: Array<{ id: string; path: string; kind?: string; size?: number; created_at?: string }>
   error?: string | null
+}
+
+export type KernelSanity = {
+  ok: boolean
+  env?: { is_wsl?: boolean }
+  ncu: { found: boolean; version?: string | null; path?: string | null }
+  nsys?: { found: boolean }
+  python: string
+  torch_cuda_available?: boolean | null
+  artifact?: string | null
+  kernels: Array<{ name: string; calls?: number | null; time_ms?: number | null; avg_ms?: number | null; pct_gpu_time?: number | null }>
+  num_unique_kernels: number
+  tried_sets?: string[][]
+  stdout?: string | null
+  stderr?: string | null
+  raw_preview?: string | null
+  notes?: string[]
 }

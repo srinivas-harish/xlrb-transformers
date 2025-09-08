@@ -1,5 +1,6 @@
 # worker.py
 import os, json, shutil
+from typing import Optional
 from celery import Celery
 
 from main import (
@@ -9,7 +10,7 @@ from db import (
     get_session, update_status, append_epoch, complete_run, add_artifact, init_db, get_run_row
 )
 from profiling import (
-    have_nsys, have_ncu, run_with_nsys, export_nsys_stats, parse_nsys_csvs, run_with_ncu, parse_nsys_sqlite
+    have_nsys, have_ncu, run_with_nsys, export_nsys_stats, parse_nsys_csvs, run_with_ncu, parse_nsys_sqlite, parse_ncu_raw
 )
 import subprocess
 import threading
@@ -61,6 +62,23 @@ def run_ablation_task(self, run_id: str, req: dict):
 
         report_path = os.path.join(save_dir, "report.json")
         profiling_summary = None
+        ncu_kernels: Optional[dict] = None
+        # Diagnostics container for frontend visibility when kernels=0
+        diag: dict = {
+            "detected_tools": {"nsys": have_nsys(), "ncu": have_ncu()},
+            "artifacts": {"nsys_rep": False, "nsys_sqlite": False, "ncu_rep": False},
+            "csv_reports": [],
+            "kernels_source": None,
+            "counts": {},
+            "notes": [],
+        }
+        try:
+            import platform
+            rel = platform.release().lower()
+            if "microsoft" in rel or os.environ.get("WSL_DISTRO_NAME"):
+                diag.setdefault("env", {})["is_wsl"] = True
+        except Exception:
+            pass
 
         # Tail progress file in a background thread to push epochs to DB live
         stop_evt = threading.Event()
@@ -106,17 +124,35 @@ def run_ablation_task(self, run_id: str, req: dict):
             if rep_path:
                 stats_out_base = os.path.join(nsys_dir, f"{run_id}.stats")
                 stats_res = export_nsys_stats(rep_path, stats_out_base)
+                diag["artifacts"]["nsys_rep"] = True
                 if stats_res.get("csv"):
+                    try:
+                        diag["csv_reports"] = sorted(list((stats_res.get("csv") or {}).keys()))
+                    except Exception:
+                        pass
                     profiling_summary = parse_nsys_csvs(stats_res["csv"]) or {}
+                    try:
+                        diag["counts"]["nsys_csv_kernels"] = len((profiling_summary or {}).get("kernels") or [])
+                    except Exception:
+                        pass
+                    if (profiling_summary or {}).get("kernels") and not diag.get("kernels_source"):
+                        diag["kernels_source"] = "nsys_csv"
                     # If CSV parsing produced weak/empty summary fields, enrich from SQLite if present
                     sqlite_path = nsys_res.get("sqlite")
                     if sqlite_path and os.path.exists(sqlite_path):
                         try:
                             parsed_sql = parse_nsys_sqlite(sqlite_path) or {}
+                            diag["artifacts"]["nsys_sqlite"] = True
                             if parsed_sql:
                                 for k, v in parsed_sql.items():
                                     if (k not in profiling_summary) or (profiling_summary.get(k) in (None, [], {}, 0) and v not in (None, [], {})):
                                         profiling_summary[k] = v
+                                try:
+                                    if parsed_sql.get("kernels") and not diag.get("kernels_source"):
+                                        diag["kernels_source"] = "nsys_sqlite"
+                                    diag["counts"]["nsys_sqlite_kernels"] = len(parsed_sql.get("kernels") or [])
+                                except Exception:
+                                    pass
                         except Exception:
                             pass
                 # Fallback: try parsing the .sqlite directly if CSV export failed entirely
@@ -125,6 +161,13 @@ def run_ablation_task(self, run_id: str, req: dict):
                     if sqlite_path and os.path.exists(sqlite_path):
                         try:
                             profiling_summary = parse_nsys_sqlite(sqlite_path) or {}
+                            diag["artifacts"]["nsys_sqlite"] = True
+                            try:
+                                if (profiling_summary or {}).get("kernels") and not diag.get("kernels_source"):
+                                    diag["kernels_source"] = "nsys_sqlite"
+                                diag["counts"]["nsys_sqlite_kernels"] = len((profiling_summary or {}).get("kernels") or [])
+                            except Exception:
+                                pass
                         except Exception:
                             profiling_summary = {}
                 # Register artifacts
@@ -173,14 +216,49 @@ def run_ablation_task(self, run_id: str, req: dict):
             if ncu_res.get("ncu_rep") and os.path.exists(ncu_res["ncu_rep"]):
                 with get_session() as s:
                     add_artifact(s, run_id, "ncu", ncu_res["ncu_rep"], bytes=os.path.getsize(ncu_res["ncu_rep"]))
+                # Parse kernels from the NCU report (best-effort)
+                try:
+                    parsed_ncu = parse_ncu_raw(ncu_res["ncu_rep"]) or None
+                except Exception:
+                    parsed_ncu = None
+                diag["artifacts"]["ncu_rep"] = True
+                if parsed_ncu and parsed_ncu.get("kernels"):
+                    ncu_kernels = parsed_ncu
+                    # record counts and source
+                    try:
+                        diag["counts"]["ncu_kernels"] = len(parsed_ncu.get("kernels") or [])
+                    except Exception:
+                        pass
+                    if not diag.get("kernels_source"):
+                        diag["kernels_source"] = "ncu_raw"
+            else:
+                # Persist stderr to help diagnose missing NCU report (e.g., restricted counters on Windows/WSL)
+                try:
+                    err_txt = (ncu_res or {}).get("stderr")
+                    if err_txt:
+                        err_path = os.path.join(ncu_dir, f"{run_id}.ncu.stderr.txt")
+                        with open(err_path, "w") as ef:
+                            ef.write(err_txt)
+                        with get_session() as s:
+                            add_artifact(s, run_id, "txt", err_path, bytes=os.path.getsize(err_path))
+                    # Add a brief hint to diagnostics
+                    tried_sets = (ncu_res or {}).get("tried_sets") or []
+                    if tried_sets:
+                        diag["notes"].append(f"Nsight Compute did not produce a report; tried sets: {' '.join(sum(tried_sets, []))}.")
+                    else:
+                        diag["notes"].append("Nsight Compute did not produce a report. If on Windows/WSL, enable GPU performance counters in NVIDIA Control Panel or try running again.")
+                except Exception:
+                    pass
 
         # Load report
         if not os.path.exists(report_path):
             raise RuntimeError(f"Training report not found at {report_path}")
         with open(report_path) as f:
             result = json.load(f)
+        result.setdefault("profiling", {})
+        profiling_out = result["profiling"]
+
         if profiling_summary:
-            result.setdefault("profiling", {})
             # Split concise and detailed views for the UI
             # Summary keys are a subset; details include lists
             summary_keys = {
@@ -189,16 +267,50 @@ def run_ablation_task(self, run_id: str, req: dict):
             }
             nsys_sum = {k: v for k, v in profiling_summary.items() if k in summary_keys}
             nsys_details = {k: v for k, v in profiling_summary.items() if k not in summary_keys}
-            result["profiling"]["nsys_summary"] = nsys_sum
+            profiling_out["nsys_summary"] = nsys_sum
             if nsys_details:
-                result["profiling"]["nsys_details"] = nsys_details
+                profiling_out["nsys_details"] = nsys_details
         else:
             # If we have an Nsight artifact but no summary, surface a marker so UI can show guidance
-            result.setdefault("profiling", {})
-            result["profiling"].setdefault("nsys_summary", None)
+            profiling_out.setdefault("nsys_summary", None)
+
+        # If we extracted kernels from NCU, merge them into details so UI shows them
+        if ncu_kernels and ncu_kernels.get("kernels"):
+            # Ensure details object
+            details = profiling_out.setdefault("nsys_details", {})
+            if not details.get("kernels"):
+                details["kernels"] = ncu_kernels["kernels"]
+            # Ensure summary exists (object, not None) so the UI doesn't show the empty notice
+            if profiling_out.get("nsys_summary") is None:
+                profiling_out["nsys_summary"] = {}
+            # Fill num_unique_kernels if missing
+            try:
+                if "num_unique_kernels" not in profiling_out["nsys_summary"] or profiling_out["nsys_summary"]["num_unique_kernels"] in (None, 0):
+                    profiling_out["nsys_summary"]["num_unique_kernels"] = int(ncu_kernels.get("num_unique_kernels") or len(ncu_kernels.get("kernels") or []))
+            except Exception:
+                pass
+
+        # Attach diagnostics; include a hint if kernels still look zero
+        try:
+            details = profiling_out.get("nsys_details") or {}
+            kernels_list = (details.get("kernels") or [])
+            num_from_sum = None
+            try:
+                num_from_sum = profiling_out.get("nsys_summary", {}).get("num_unique_kernels")
+            except Exception:
+                num_from_sum = None
+            if (not kernels_list) and (not num_from_sum or int(num_from_sum) == 0):
+                if diag.get("env", {}).get("is_wsl"):
+                    diag["notes"].append("WSL detected: Nsight Systems may not capture CUPTI kernel tables; relying on Nsight Compute artifacts.")
+                if diag["artifacts"].get("ncu_rep") and diag["counts"].get("ncu_kernels", 0) == 0:
+                    diag["notes"].append("Nsight Compute report found but no kernels parsed. Ensure GPU performance counters are enabled in Windows NVIDIA Control Panel, and that the NCU run captured kernels.")
+                    diag["notes"].append("Hint: older runs may have used a restrictive kernel_regex; current config profiles all kernels (regex ). Re-run to populate kernels.")    
+        except Exception:
+            pass
+        profiling_out["debug"] = diag
 
         # Optional: over-write report.json to include profiling summary if we added it
-        if result.get("save_dir") and profiling_summary is not None:
+        if result.get("save_dir") and (profiling_summary is not None or ncu_kernels is not None):
             try:
                 with open(report_path, "w") as f:
                     json.dump(result, f, indent=2)

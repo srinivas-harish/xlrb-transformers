@@ -3,10 +3,43 @@ import json
 import shutil
 import subprocess
 from typing import Dict, Any, Optional, List, Tuple
+import re
+import io
+import glob
+import sys
+import uuid
+import tempfile
 
 
 def _which(exe: str) -> Optional[str]:
-    return shutil.which(exe)
+    """
+    More robust which() that also searches common CUDA install locations so the
+    Celery/uvicorn environment can find Nsight tools even if PATH is minimal.
+    """
+    p = shutil.which(exe)
+    if p:
+        return p
+    # Try CUDA_HOME / CUDA_PATH
+    for env in (os.environ.get("CUDA_HOME"), os.environ.get("CUDA_PATH")):
+        if not env:
+            continue
+        cand = os.path.join(env, "bin", exe)
+        if os.path.exists(cand):
+            return cand
+        if os.name == "nt":
+            cand_exe = cand + ".exe"
+            if os.path.exists(cand_exe):
+                return cand_exe
+    # Common Linux locations
+    candidates = []
+    # /usr/local/cuda, versions, and Nsight standalone installs
+    candidates.extend(glob.glob("/usr/local/cuda*/bin/" + exe))
+    candidates.append(f"/opt/nvidia/nsight-compute/{exe}")
+    candidates.append(f"/opt/nvidia/nsight-systems/{exe}")
+    for cand in candidates:
+        if os.path.exists(cand):
+            return cand
+    return None
 
 
 def have_nsys() -> bool:
@@ -76,7 +109,23 @@ def run_with_nsys(base_cmd: List[str], out_base: str, *, trace: str = "cuda,nvtx
     # Nsight Systems has used .qdrep historically; newer versions default to .nsys-rep
     qdrep = out_base + ".qdrep"
     nsys_rep = out_base + ".nsys-rep"
+    rep_path = qdrep if os.path.exists(qdrep) else (nsys_rep if os.path.exists(nsys_rep) else None)
+    # Proactively export a full timeline SQLite from the .rep to ensure kernel tables exist
     sqlite = out_base + ".sqlite"
+    if rep_path and not os.path.exists(sqlite):
+        # Try multiple export syntaxes to handle version differences
+        export_cmds = [
+            [nsys, "export", "--sqlite", "true", "--force-overwrite=true", "-o", out_base, rep_path],
+            [nsys, "export", "--type", "sqlite", "--force-overwrite=true", "-o", out_base, rep_path],
+            [nsys, "export", "-t", "sqlite", "--force-overwrite=true", "-o", out_base, rep_path],
+        ]
+        for ec in export_cmds:
+            try:
+                run_cmd(ec)
+                if os.path.exists(sqlite):
+                    break
+            except Exception:
+                continue
     return {
         "ok": code == 0,
         "returncode": code,
@@ -230,8 +279,9 @@ def parse_nsys_csvs(csvs: Dict[str, str]) -> Dict[str, Any]:
     cuda_api: List[Dict[str, Any]] = []
     transfers_map: Dict[str, Dict[str, Any]] = {}
 
-    # gpu-activities: sum times and memcpy/memset buckets
+    # gpu-activities: sum times and memcpy/memset buckets; also fallback kernel aggregation
     act_path = csvs.get("gpu-activities")
+    kern_agg: Dict[str, Dict[str, Any]] = {}
     if act_path and os.path.exists(act_path):
         with open(act_path, newline="") as f:
             reader = csv.DictReader(f)
@@ -249,17 +299,33 @@ def parse_nsys_csvs(csvs: Dict[str, str]) -> Dict[str, Any]:
                 if time_ns is None:
                     continue
                 total_gpu_time_ms += time_ns / 1e6
-                name = "".join([row.get("Name") or row.get("name") or row.get("Activity Name") or ""])  # type: ignore
+                # Try common name columns
+                name = (
+                    row.get("Name")
+                    or row.get("name")
+                    or row.get("Activity Name")
+                    or row.get("Activity" )
+                    or ""
+                )
+                name = str(name)
                 lname = name.lower()
+                # Transfers buckets
                 if "memcpy" in lname:
                     memcpy_time_ms += time_ns / 1e6
                     d = transfers_map.setdefault(name, {"name": name, "time_ms": 0.0, "calls": 0})
                     d["time_ms"] += time_ns / 1e6
                     d["calls"] += 1
+                    continue
                 if "memset" in lname:
                     memset_time_ms += time_ns / 1e6
                     d = transfers_map.setdefault(name, {"name": name, "time_ms": 0.0, "calls": 0})
                     d["time_ms"] += time_ns / 1e6
+                    d["calls"] += 1
+                    continue
+                # Fallback kernel aggregation from activities when a dedicated kernel summary isn't available
+                if name:
+                    d = kern_agg.setdefault(name, {"name": name, "time_ns": 0.0, "calls": 0})
+                    d["time_ns"] += time_ns
                     d["calls"] += 1
 
     # gpu-kern-summary: count unique kernel names
@@ -292,6 +358,18 @@ def parse_nsys_csvs(csvs: Dict[str, str]) -> Dict[str, Any]:
                         "time_ms": (tot_ns / 1e6) if tot_ns is not None else None,
                         "avg_ms": (avg_ns / 1e6) if avg_ns is not None else None,
                     })
+    # If we didn't get a dedicated kernel summary, synthesize kernels from activities
+    if not kernels and kern_agg:
+        for name, d in kern_agg.items():
+            unique_kernels.add(name)
+            t_ms = d["time_ns"] / 1e6
+            c = int(d.get("calls") or 0)
+            kernels.append({
+                "name": name,
+                "calls": c or None,
+                "time_ms": t_ms,
+                "avg_ms": (t_ms / c) if c else None,
+            })
 
     # summary: wall clock time
     sum_path = csvs.get("summary")
@@ -369,7 +447,7 @@ def parse_nsys_csvs(csvs: Dict[str, str]) -> Dict[str, Any]:
     transfers = sorted(transfers_map.values(), key=lambda d: d.get("time_ms", 0.0), reverse=True)
 
     # Prefer showing 0 kernels instead of null if none were found
-    num_unique_kernels = len(unique_kernels) if unique_kernels else (0 if not kernels_proc else len(kernels_proc))
+    num_unique_kernels = len(unique_kernels) if unique_kernels else (0 if not kernels_proc else len({k["name"] for k in kernels_proc if k.get("name")}))
 
     return {
         "gpu_busy_pct": gpu_busy_pct,
@@ -476,56 +554,89 @@ def parse_nsys_sqlite(sqlite_path: str) -> Optional[Dict[str, Any]]:
 
     try:
         tbls = list_tables(cur)
-        # Find a plausible kernel table
-        kernel_tbl = None
-        kernel_name_col = None
+        # Aggregate across any plausible kernel tables; different versions use different names
+        kern_agg: Dict[str, Dict[str, Any]] = {}
         for t in tbls:
             tl = t.lower()
-            if "kernel" in tl and ("cupti" in tl or "cuda" in tl or "gpu" in tl):
-                # Inspect columns
+            if ("kernel" not in tl) or not ("cupti" in tl or "cuda" in tl or "gpu" in tl):
+                continue
+            # Inspect columns
+            try:
                 cur.execute(f"pragma table_info('{t}')")
                 cols = [r[1] for r in cur.fetchall()]
-                cols_l = [c.lower() for c in cols]
-                if ("start" in cols_l and "end" in cols_l):
-                    # Prefer demangled name if present
-                    if "demanglednameid" in cols_l:
-                        kernel_name_col = "demangledNameId"
-                    elif "nameid" in cols_l:
-                        kernel_name_col = "nameId"
-                    elif "name" in cols_l:
-                        kernel_name_col = "name"
-                    else:
-                        continue
-                    kernel_tbl = t
-                    break
-        if kernel_tbl and kernel_name_col:
-            if kernel_name_col.lower().endswith("id"):
-                # Join through StringIds
-                qk = (
-                    f"select s.value as name, count(*) as calls, "
-                    f"sum(k.end - k.start) as total_ns, avg(k.end - k.start) as avg_ns "
-                    f"from {kernel_tbl} k join StringIds s on s.id = k.{kernel_name_col} "
-                    f"group by k.{kernel_name_col} order by total_ns desc"
-                )
-            else:
-                qk = (
-                    f"select k.{kernel_name_col} as name, count(*) as calls, "
-                    f"sum(k.end - k.start) as total_ns, avg(k.end - k.start) as avg_ns "
-                    f"from {kernel_tbl} k group by k.{kernel_name_col} order by total_ns desc"
-                )
-            try:
-                for name, calls, total_ns, avg_ns in cur.execute(qk):
-                    ms = (total_ns / 1e6) if total_ns is not None else None
-                    kernels.append({
-                        "name": name,
-                        "calls": int(calls) if calls is not None else None,
-                        "time_ms": ms,
-                        "avg_ms": (avg_ns / 1e6) if avg_ns is not None else None,
-                    })
-                num_unique_kernels = len(kernels) if kernels else None
-                total_gpu_time_ms += sum((k.get("time_ms") or 0.0) for k in kernels)
             except Exception:
-                pass
+                continue
+            cols_l = [c.lower() for c in cols]
+            if not ("start" in cols_l and "end" in cols_l):
+                continue
+            # Try to find an identifier for the kernel name
+            name_id_col = None
+            name_str_col = None
+            # Prefer demangledNameId, but accept any *nameId column
+            if "demanglednameid" in cols_l:
+                name_id_col = cols[cols_l.index("demanglednameid")]
+            else:
+                # fallback: any column ending with 'nameid'
+                for c in cols:
+                    cl = c.lower()
+                    if cl.endswith("nameid"):
+                        name_id_col = c
+                        break
+            # If no id, try direct string columns like demangledName/name/shortName
+            if not name_id_col:
+                for pref in ("demangledname", "name", "shortname"):
+                    if pref in cols_l:
+                        name_str_col = cols[cols_l.index(pref)]
+                        break
+                if not name_str_col:
+                    # any column ending with 'name'
+                    for c in cols:
+                        if c.lower().endswith("name"):
+                            name_str_col = c
+                            break
+            # Build and execute aggregation query for this table
+            try:
+                if name_id_col:
+                    qk = (
+                        f"select s.value as name, count(*) as calls, "
+                        f"sum(k.end - k.start) as total_ns, avg(k.end - k.start) as avg_ns "
+                        f"from {t} k join StringIds s on s.id = k.{name_id_col} "
+                        f"group by k.{name_id_col}"
+                    )
+                elif name_str_col:
+                    qk = (
+                        f"select k.{name_str_col} as name, count(*) as calls, "
+                        f"sum(k.end - k.start) as total_ns, avg(k.end - k.start) as avg_ns "
+                        f"from {t} k group by k.{name_str_col}"
+                    )
+                else:
+                    continue
+                for name, calls, total_ns, avg_ns in cur.execute(qk):
+                    if not name:
+                        continue
+                    d = kern_agg.setdefault(name, {"name": name, "calls": 0, "total_ns": 0.0, "sum_avg_ns": 0.0, "avg_cnt": 0})
+                    d["calls"] += int(calls) if calls is not None else 0
+                    if total_ns is not None:
+                        d["total_ns"] += float(total_ns)
+                    if avg_ns is not None:
+                        d["sum_avg_ns"] += float(avg_ns)
+                        d["avg_cnt"] += 1
+            except Exception:
+                # best effort on each table
+                continue
+        if kern_agg:
+            for d in kern_agg.values():
+                t_ms = d["total_ns"] / 1e6 if d.get("total_ns") else None
+                avg_ns = (d["sum_avg_ns"] / d["avg_cnt"]) if d.get("avg_cnt") else None
+                kernels.append({
+                    "name": d["name"],
+                    "calls": d["calls"] or None,
+                    "time_ms": t_ms,
+                    "avg_ms": (avg_ns / 1e6) if avg_ns is not None else None,
+                })
+            # unique names across all tables
+            num_unique_kernels = len(kern_agg)
+            total_gpu_time_ms += sum((k.get("time_ms") or 0.0) for k in kernels)
     except Exception:
         pass
 
@@ -623,30 +734,501 @@ def parse_nsys_sqlite(sqlite_path: str) -> Optional[Dict[str, Any]]:
     return out
 
 
-def run_with_ncu(base_cmd: List[str], out_base: str, *, kernel_regex: str = ".*(gemm|matmul|attention|ScaledDotProduct).*", profile_set: str = "speed-of-light") -> Dict[str, Any]:
+def run_with_ncu(
+    base_cmd: List[str],
+    out_base: str,
+    *,
+    profile_set: Optional[str] = None,
+) -> Dict[str, Any]:
     """
-    Runs Nsight Compute to profile hot kernels. Produces .ncu-rep at out_base.
+    Runs Nsight Compute to profile kernels. Produces .ncu-rep at out_base.
+
+    Be defensive across environments (e.g., WSL) where some counter sets are
+    restricted and cause NCU to fail without producing a report. We try a
+    fallback sequence of lighter profiling sets.
     """
     ncu = _which("ncu")
     if not ncu:
         return {"ok": False, "error": "ncu not found in PATH"}
     out_dir = os.path.dirname(out_base)
     os.makedirs(out_dir, exist_ok=True)
-    cmd = [
-        ncu,
-        "--target-processes", "all",
-        "--kernel-name-base", "demangled",
-        "--kernel-regex", kernel_regex,
-        "--set", profile_set,
-        "-o", out_base,
-        *base_cmd,
-    ]
-    code, out, err = run_cmd(cmd)
+
+    # Ensure we don't fail due to an existing report file
     rep = out_base + ".ncu-rep"
+    try:
+        if os.path.exists(rep):
+            os.remove(rep)
+    except Exception:
+        pass
+
+    tried: List[Tuple[List[str], Tuple[int, str, str]]] = []
+
+    def attempt(set_name: Optional[str], *, tproc: str = "all") -> Tuple[bool, Tuple[int, str, str]]:
+        cmd = [
+            ncu,
+            "--target-processes", tproc,
+            "--kernel-name-base", "demangled",
+            "-f",  # force-overwrite
+            "-o", out_base,
+        ]
+        if set_name:
+            cmd += ["--set", set_name]
+        # Separate NCU options from application command explicitly
+        cmd += ["--", *base_cmd]
+        code, out, err = run_cmd(cmd)
+        return (os.path.exists(rep) and code == 0), (code, out, err)
+
+    # Try default (no set) first for broader compatibility (e.g., WSL counters),
+    # then progressively add lightweight sets. If caller requested a set, try it first.
+    sets_to_try: List[Optional[str]] = []
+    if profile_set not in (None, "<default>"):
+        sets_to_try.append(profile_set)
+    for alt in (None, "launch-and-kernel", "launch", "speed-of-light"):
+        if alt not in sets_to_try:
+            sets_to_try.append(alt)
+
+    ok = False
+    last_res: Tuple[int, str, str] = (0, "", "")
+    for sname in sets_to_try:
+        ok, last_res = attempt(sname, tproc="all")
+        tried.append((["--set", (sname or "<default>")], last_res))
+        if ok:
+            break
+        # If the previous attempt failed and produced a partial/empty file, remove it before retry
+        try:
+            if os.path.exists(rep):
+                os.remove(rep)
+        except Exception:
+            pass
+
+    # As a last attempt, try application-only targeting (rarely helps with launchers)
+    if not ok:
+        try:
+            ok, last_res = attempt(sets_to_try[-1], tproc="application-only")
+            tried.append((["--target-processes", "application-only"], last_res))
+        except Exception:
+            pass
+
+    code, out, err = last_res
     return {
-        "ok": code == 0,
+        "ok": ok and code == 0,
         "returncode": code,
         "stdout": out,
         "stderr": err,
         "ncu_rep": rep if os.path.exists(rep) else None,
+        "tried_sets": [flags for flags, _ in tried],
     }
+
+
+def parse_ncu_raw(rep_path: str) -> Optional[Dict[str, Any]]:
+    """
+    Best-effort parser for Nsight Compute .ncu-rep using CSV "raw" page.
+
+    Returns a dict like:
+      {
+        "kernels": [ { name, calls?, time_ms?, avg_ms?, pct_gpu_time? }, ...],
+        "num_unique_kernels": int
+      }
+
+    Notes:
+      - NCU page availability varies; we intentionally use "--page raw" because it is
+        widely present (even when "summary" pages are not).
+      - The CSV content is not a single fixed schema. We heuristically look for rows
+        that introduce a kernel (e.g., "Kernel Name", or a single-cell "Kernel: <name>")
+        and then collect nearby metrics like Duration/Time and Invocations/Calls.
+      - We sum durations across passes/instances and aggregate calls.
+    """
+    ncu = _which("ncu")
+    if not ncu or not os.path.exists(rep_path):
+        return None
+
+    # Try to import with the raw page first
+    code, csv_text, err = run_cmd([ncu, "--import", rep_path, "--csv", "--page", "raw"])
+    if code != 0 or not csv_text:
+        # As a fallback, try without explicit page (older builds dump a default table)
+        code2, out2, err2 = run_cmd([ncu, "--import", rep_path, "--csv"])  # best-effort
+        if code2 != 0 or not out2:
+            return None
+        csv_text = out2
+
+    import csv
+    rdr = csv.reader(io.StringIO(csv_text))
+
+    agg: Dict[str, Dict[str, Any]] = {}
+    current: Optional[str] = None
+
+    def ensure(name: str) -> Dict[str, Any]:
+        d = agg.get(name)
+        if not d:
+            d = {"name": name, "calls": 0, "time_ms": 0.0, "_avg_ms_acc": [], "_avg_ms_cnt": 0}
+            agg[name] = d
+        return d
+
+    def parse_number(s: str) -> Optional[float]:
+        s = (s or "").strip()
+        if not s:
+            return None
+        # Strip common decorations
+        s = s.replace(",", "")
+        try:
+            return float(s)
+        except Exception:
+            return None
+
+    def pick_unit(row: List[str], label: str) -> Optional[str]:
+        lab = (label or "").lower()
+        if "(ns)" in lab or re.search(r"\bns\b", lab):
+            return "ns"
+        if "(ms)" in lab or re.search(r"\bms\b", lab):
+            return "ms"
+        if "(s)" in lab or re.search(r"\bs(ec|econd|)s?\b", lab):
+            return "s"
+        for tok in row[1:4]:
+            t = (tok or "").strip().lower()
+            if t in ("ns", "ms", "s", "sec", "second", "seconds"):
+                return "s" if t.startswith("s") else t
+        return None
+
+    for row in rdr:
+        if not row:
+            continue
+        # Normalize
+        cells = [c.strip() for c in row]
+        c0 = (cells[0] if cells else "").strip()
+        c0l = c0.lower()
+
+        # Kernel introduction lines
+        name: Optional[str] = None
+        if len(cells) >= 2 and c0l == "kernel name":
+            name = cells[1]
+        elif re.match(r"(?i)^kernel:\s*", c0):
+            name = re.sub(r"(?i)^kernel:\s*", "", c0).strip()
+
+        if name:
+            current = name
+            ensure(name)
+            continue
+
+        if not current:
+            continue
+
+        # Metric rows under a kernel
+        label = c0l
+        # Find first numeric value in the next few cells
+        val: Optional[float] = None
+        for idx in range(1, min(len(cells), 6)):
+            v = parse_number(cells[idx])
+            if v is not None:
+                val = v
+                break
+
+        if val is None:
+            continue
+
+        # Duration / Time aggregation
+        if ("duration" in label) or ("time" in label and "kernel" not in label and "%" not in label):
+            unit = pick_unit(cells, c0)
+            ms = None
+            if unit == "ns":
+                ms = val / 1e6
+            elif unit == "ms":
+                ms = val
+            elif unit == "s":
+                ms = val * 1000.0
+            else:
+                # Unknown; pick a sane heuristic
+                if val > 1e6:
+                    ms = val / 1e6
+                elif val > 1000:
+                    ms = val / 1000.0
+                elif val < 100:
+                    ms = val * 1000.0
+                else:
+                    ms = val
+            ensure(current)["time_ms"] += ms
+            continue
+
+        # Calls / Invocations
+        if ("invocations" in label) or ("calls" in label) or ("launches" in label) or ("instances" in label):
+            try:
+                ensure(current)["calls"] += int(round(val))
+            except Exception:
+                pass
+            continue
+
+        # Avg duration
+        if "avg" in label and ("ns" in label or "ms" in label or "s" in label):
+            unit = pick_unit(cells, c0)
+            ms = None
+            if unit == "ns":
+                ms = val / 1e6
+            elif unit == "ms":
+                ms = val
+            elif unit == "s":
+                ms = val * 1000.0
+            if ms is not None:
+                d = ensure(current)
+                d["_avg_ms_acc"].append(ms)
+                d["_avg_ms_cnt"] += 1
+
+    # If the above row-wise heuristic failed (common for NCU "raw" page formats
+    # where data is provided in a flat table with column names), try a
+    # column-driven parse like the user's working AWK example.
+    if not agg:
+        try:
+            dr = csv.DictReader(io.StringIO(csv_text))
+            key_kernel = None
+            key_calls = None
+            key_time_ns = None
+            key_avg_ns = None
+
+            # Build lowercase header map
+            headers = [h for h in (dr.fieldnames or [])]
+            hl = [h.lower() for h in headers]
+
+            def find_col(preds):
+                for i, h in enumerate(hl):
+                    if preds(h):
+                        return headers[i]
+                return None
+
+            key_kernel = find_col(lambda h: ("kernel" in h and "name" in h)) or "Kernel Name"
+            key_calls = find_col(lambda h: ("calls" in h) or ("invocations" in h) or ("instances" in h) or ("launches" in h))
+            key_time_ns = find_col(lambda h: ("time" in h and "ns" in h) or ("duration" in h and "ns" in h))
+            key_avg_ns = find_col(lambda h: ("avg" in h and "ns" in h) or ("average" in h and "ns" in h))
+
+            agg2: Dict[str, Dict[str, Any]] = {}
+            for row in dr:
+                name = (row.get(key_kernel) or "").strip() if key_kernel else ""
+                if not name:
+                    continue
+                d = agg2.setdefault(name, {"name": name, "calls": 0, "time_ns": 0.0, "avg_ns_acc": 0.0, "avg_cnt": 0})
+                # calls
+                if key_calls:
+                    try:
+                        c = row.get(key_calls)
+                        if c is not None and str(c).strip() != "":
+                            d["calls"] += int(float(str(c).replace(",", "")))
+                    except Exception:
+                        pass
+                # total time ns
+                if key_time_ns:
+                    try:
+                        v = row.get(key_time_ns)
+                        if v is not None and str(v).strip() != "":
+                            d["time_ns"] += float(str(v).replace(",", ""))
+                    except Exception:
+                        pass
+                # avg ns (optional)
+                if key_avg_ns:
+                    try:
+                        v = row.get(key_avg_ns)
+                        if v is not None and str(v).strip() != "":
+                            d["avg_ns_acc"] += float(str(v).replace(",", ""))
+                            d["avg_cnt"] += 1
+                    except Exception:
+                        pass
+
+            if agg2:
+                kernels: List[Dict[str, Any]] = []
+                for d in agg2.values():
+                    avg_ms = None
+                    if d["avg_cnt"] > 0:
+                        avg_ms = (d["avg_ns_acc"] / d["avg_cnt"]) / 1e6
+                    elif d.get("calls") and d.get("time_ns"):
+                        try:
+                            c = int(d["calls"]) or 0
+                            avg_ms = ((d["time_ns"] / 1e6) / c) if c else None
+                        except Exception:
+                            avg_ms = None
+                    kernels.append({
+                        "name": d["name"],
+                        "calls": d.get("calls") or None,
+                        "time_ms": (d.get("time_ns") or 0.0) / 1e6,
+                        "avg_ms": avg_ms,
+                        "pct_gpu_time": None,
+                    })
+                kernels_sorted = sorted(kernels, key=lambda r: r.get("time_ms", 0.0) or 0.0, reverse=True)[:30]
+                return {"kernels": kernels_sorted, "num_unique_kernels": len(agg2)}
+        except Exception:
+            pass
+
+        return None
+
+    kernels: List[Dict[str, Any]] = []
+    total_time_ms = 0.0
+    for k in agg.values():
+        avg_ms: Optional[float] = None
+        if k["_avg_ms_cnt"] > 0:
+            avg_ms = sum(k["_avg_ms_acc"]) / float(k["_avg_ms_cnt"])
+        elif k.get("calls") and k.get("time_ms"):
+            try:
+                c = int(k["calls"]) or 0
+                avg_ms = (k["time_ms"] / c) if c else None
+            except Exception:
+                avg_ms = None
+        total_time_ms += float(k.get("time_ms") or 0.0)
+        kernels.append({
+            "name": k["name"],
+            "calls": (k.get("calls") or None),
+            "time_ms": (k.get("time_ms") or None),
+            "avg_ms": avg_ms,
+            "pct_gpu_time": None,  # unknown without a robust total
+        })
+
+    kernels_sorted = sorted(kernels, key=lambda d: d.get("time_ms", 0.0) or 0.0, reverse=True)[:30]
+
+    out = {
+        "kernels": kernels_sorted,
+        "num_unique_kernels": len(agg),
+        # We intentionally omit total time and pct fields; those remain None in UI
+    }
+    return out
+
+
+def run_cuda_kernel_test() -> Dict[str, Any]:
+    """
+    Runs a short dummy CUDA workload under Nsight Compute to verify that device
+    kernels are captured. Returns a detailed diagnostics dict with environment
+    info, kernel list, and raw CSV preview when available.
+
+    This does NOT associate with any run; it writes artifacts under project/tmp.
+    """
+    out: Dict[str, Any] = {
+        "ok": False,
+        "env": {},
+        "ncu": {"found": False, "version": None, "path": None},
+        "nsys": {"found": have_nsys()},
+        "python": sys.executable,
+        "torch_cuda_available": None,
+        "artifact": None,
+        "kernels": [],
+        "num_unique_kernels": 0,
+        "tried_sets": [],
+        "stdout": None,
+        "stderr": None,
+        "raw_preview": None,
+        "notes": [],
+    }
+
+    # Env flags
+    try:
+        rel = __import__("platform").release().lower()
+        if "microsoft" in rel or os.environ.get("WSL_DISTRO_NAME"):
+            out["env"]["is_wsl"] = True
+    except Exception:
+        pass
+
+    ncu = _which("ncu")
+    if ncu:
+        out["ncu"]["found"] = True
+        out["ncu"]["path"] = ncu
+        try:
+            code, vout, _ = run_cmd([ncu, "--version"])  # prints version info
+            if vout:
+                out["ncu"]["version"] = vout.strip().splitlines()[0].strip()
+        except Exception:
+            pass
+
+    # Prepare temp paths under project/tmp
+    root = os.path.dirname(__file__)
+    tmp_dir = os.path.join(root, "tmp")
+    os.makedirs(tmp_dir, exist_ok=True)
+    stamp = uuid.uuid4().hex[:8]
+    script_path = os.path.join(tmp_dir, f"cuda_sanity_{stamp}.py")
+    out_base = os.path.join(tmp_dir, f"ncu_cuda_sanity_{stamp}")
+    rep = out_base + ".ncu-rep"
+
+    # Emit small CUDA workload script
+    script = """
+import torch
+print("cuda available:", torch.cuda.is_available())
+if torch.cuda.is_available():
+    # Larger matmul to ensure measurable kernels across devices
+    a = torch.randn(8192, 8192, device="cuda")
+    b = torch.randn(8192, 8192, device="cuda")
+    c = a @ b
+    torch.cuda.synchronize()
+print("done")
+"""
+    try:
+        with open(script_path, "w") as f:
+            f.write(script)
+    except Exception as e:
+        out["stderr"] = f"failed to write script: {e}"
+        return out
+
+    # Baseline: run without NCU to report torch CUDA availability
+    try:
+        code, pout, perr = run_cmd([sys.executable, script_path])
+        out["stdout"] = pout
+        out["stderr"] = perr or out.get("stderr")
+        if pout and "cuda available:" in pout:
+            avail = pout.split("cuda available:")[-1].strip().splitlines()[0].strip()
+            out["torch_cuda_available"] = (avail.lower().startswith("true"))
+    except Exception:
+        pass
+
+    # If NCU is not present, return early with baseline info
+    if not ncu:
+        out["ok"] = bool(out.get("torch_cuda_available"))
+        out["notes"].append("Nsight Compute (ncu) not found in PATH/known locations.")
+        return out
+
+    # Attempt profiling with progressive sets
+    tried: List[List[str]] = []
+    def attempt(set_name: Optional[str], *, tproc: str = "all") -> Tuple[bool, Tuple[int, str, str]]:
+        cmd = [
+            ncu,
+            "--target-processes", tproc,
+            "--kernel-name-base", "demangled",
+            "-f",
+            "-o", out_base,
+        ]
+        if set_name:
+            cmd += ["--set", set_name]
+        cmd += ["--", sys.executable, script_path]
+        code, o, e = run_cmd(cmd)
+        tried.append([a for a in cmd if a.startswith("--") or a in ("-f", "-o")])
+        return (os.path.exists(rep) and code == 0), (code, o, e)
+
+    ok = False
+    last: Tuple[int, str, str] = (0, "", "")
+    for s in (None, "launch-and-kernel", "launch", "speed-of-light"):
+        ok, last = attempt(s, tproc="all")
+        if ok:
+            break
+        try:
+            if os.path.exists(rep):
+                os.remove(rep)
+        except Exception:
+            pass
+    if not ok:
+        ok, last = attempt(None, tproc="application-only")
+
+    out["tried_sets"] = tried
+    out["artifact"] = rep if os.path.exists(rep) else None
+
+    # Parse kernels if present
+    if out["artifact"]:
+        parsed = parse_ncu_raw(rep)
+        if parsed and parsed.get("kernels"):
+            out["kernels"] = parsed["kernels"]
+            out["num_unique_kernels"] = int(parsed.get("num_unique_kernels") or len(parsed["kernels"]))
+            out["ok"] = True
+            # Raw CSV preview
+            try:
+                code, csv_raw, _ = run_cmd([ncu, "--import", rep, "--csv", "--page", "raw"])
+                if csv_raw:
+                    lines = csv_raw.splitlines()
+                    out["raw_preview"] = "\n".join(lines[:80])
+            except Exception:
+                pass
+    else:
+        out["stdout"] = (out.get("stdout") or "") + (last[1] or "")
+        out["stderr"] = (out.get("stderr") or "") + (last[2] or "")
+        out["ok"] = False
+        if out.get("env", {}).get("is_wsl"):
+            out["notes"].append("WSL detected: ensure GPU performance counters are enabled in NVIDIA Control Panel → Developer → Manage GPU Performance Counters → Allow access to All Users.")
+
+    return out

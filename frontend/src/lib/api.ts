@@ -1,5 +1,5 @@
 import axios from 'axios'
-import type { RunDetail, RunRow } from './types'
+import type { RunDetail, RunRow, KernelSanity } from './types'
 
 const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000'
 const api = axios.create({ baseURL: API_BASE, timeout: 30000 })
@@ -69,4 +69,14 @@ export async function getRun(id: string): Promise<RunDetail> {
     error: r.error ?? null,
   }
   return detail
+}
+
+export async function refreshProfiling(id: string): Promise<any> {
+  const { data } = await api.post(`/runs/${id}/refresh_profiling`)
+  return data
+}
+
+export async function kernelSanity(): Promise<KernelSanity> {
+  const { data } = await api.post('/diag/kernel_test')
+  return data as KernelSanity
 }

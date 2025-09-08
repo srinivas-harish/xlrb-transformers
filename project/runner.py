@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import torch
 from typing import Any, Dict, Optional
 
 from main import train_and_eval, base_cfg_hybrid, ABLATIONS, pick_device
@@ -44,6 +45,17 @@ def run_from_req(req: Dict[str, Any], *, run_id: Optional[str] = None, save_dir:
     eff_save_dir = save_dir or req.get("save_dir")
     if eff_save_dir:
         os.makedirs(eff_save_dir, exist_ok=True)
+
+    # Ensure at least one trivial CUDA kernel executes early for profilers like NCU
+    # (especially helpful on WSL where profiling windows can miss kernels).
+    try:
+        if device.type == "cuda" and torch.cuda.is_available():
+            _a = torch.randn(64, 64, device="cuda")
+            _b = torch.randn(64, 64, device="cuda")
+            _ = _a @ _b
+            torch.cuda.synchronize()
+    except Exception:
+        pass
 
     result = train_and_eval(
         task_ctx=None,

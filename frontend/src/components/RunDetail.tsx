@@ -1,5 +1,7 @@
 import type { RunDetail as RunDetailT } from '../lib/types'
+import { useState } from 'react'
 import MetricCard from './MetricCard'
+import { refreshProfiling } from '../lib/api'
 import ChartLine from './ChartLine'
 import EpochsTable from './EpochsTable'
 
@@ -8,6 +10,26 @@ export default function RunDetail({ data }: { data: RunDetailT }) {
   const epochs = data.result?.epochs || []
   const nsys = data.result?.profiling?.nsys_summary
   const nsysDetails = data.result?.profiling?.nsys_details
+  const debug = data.result?.profiling?.debug as any
+  const kernelsCount = (typeof nsys?.num_unique_kernels === 'number' ? nsys.num_unique_kernels : (nsysDetails?.kernels?.length || 0)) || 0
+  const hasNsysRep = (data.artifacts || []).some(a => a.path.endsWith('.qdrep') || a.path.endsWith('.nsys-rep'))
+  const hasNsysSqlite = (data.artifacts || []).some(a => a.path.endsWith('.sqlite'))
+  const hasNcuRep = (data.artifacts || []).some(a => a.path.endsWith('.ncu-rep'))
+  const csvArtifacts = (data.artifacts || []).filter(a => a.path.endsWith('.csv'))
+  const csvList = (debug?.csv_reports as string[] | undefined) || csvArtifacts.map(a => a.path.split('.').slice(-2, -1)[0])
+  const [refreshing, setRefreshing] = useState(false)
+  async function doRefresh() {
+    try {
+      setRefreshing(true)
+      await refreshProfiling(data.id)
+      // naive reload; parent is expected to refetch
+      location.reload()
+    } catch (e) {
+      setRefreshing(false)
+      console.error(e)
+      alert('Refresh failed: ' + (e as any)?.message)
+    }
+  }
   const download = (obj: any, name: string) => {
     const blob = new Blob([JSON.stringify(obj, null, 2)], { type: 'application/json' })
     const url = URL.createObjectURL(blob)
@@ -58,6 +80,67 @@ export default function RunDetail({ data }: { data: RunDetailT }) {
             <MetricCard label="# Kernels" value={
               typeof nsys.num_unique_kernels === 'number' ? nsys.num_unique_kernels : '—'
             } />
+          </div>
+        </div>
+      )}
+
+      {kernelsCount === 0 && (
+        <div className="bg-zinc-900 border border-zinc-800 rounded-lg p-4">
+          <div className="flex items-center justify-between mb-2">
+            <div>
+              <div className="text-sm font-semibold">Profiling Diagnostics</div>
+              <div className="text-xs text-zinc-400">No kernels parsed yet. Sanity checks below can help pinpoint why.</div>
+            </div>
+            <button disabled={refreshing}
+              className="text-xs px-2 py-1 rounded bg-zinc-800 hover:bg-zinc-700 disabled:opacity-50"
+              onClick={doRefresh}>{refreshing ? 'Refreshing…' : 'Re-parse Artifacts'}</button>
+          </div>
+          <div className="grid md:grid-cols-2 gap-3 text-xs">
+            <div className="space-y-1">
+              <div className="font-semibold">Sanity Checks</div>
+              <div className="flex items-center justify-between bg-zinc-950 border border-zinc-800 rounded px-2 py-1">
+                <span>Nsight Systems installed</span>
+                <span className={debug?.detected_tools?.nsys ? 'text-emerald-400' : 'text-red-400'}>{debug?.detected_tools?.nsys ? 'PASS' : 'UNKNOWN'}</span>
+              </div>
+              <div className="flex items-center justify-between bg-zinc-950 border border-zinc-800 rounded px-2 py-1">
+                <span>Nsight Compute installed</span>
+                <span className={debug?.detected_tools?.ncu ? 'text-emerald-400' : 'text-red-400'}>{debug?.detected_tools?.ncu ? 'PASS' : 'UNKNOWN'}</span>
+              </div>
+              <div className="flex items-center justify-between bg-zinc-950 border border-zinc-800 rounded px-2 py-1">
+                <span>NSYS report present (.qdrep/.nsys-rep)</span>
+                <span className={(debug?.artifacts?.nsys_rep || hasNsysRep) ? 'text-emerald-400' : 'text-red-400'}>{(debug?.artifacts?.nsys_rep || hasNsysRep) ? 'PASS' : 'FAIL'}</span>
+              </div>
+              <div className="flex items-center justify-between bg-zinc-950 border border-zinc-800 rounded px-2 py-1">
+                <span>NSYS timeline (.sqlite)</span>
+                <span className={(debug?.artifacts?.nsys_sqlite || hasNsysSqlite) ? 'text-emerald-400' : 'text-red-400'}>{(debug?.artifacts?.nsys_sqlite || hasNsysSqlite) ? 'PASS' : 'FAIL'}</span>
+              </div>
+              <div className="flex items-center justify-between bg-zinc-950 border border-zinc-800 rounded px-2 py-1">
+                <span>NCU report present (.ncu-rep)</span>
+                <span className={(debug?.artifacts?.ncu_rep || hasNcuRep) ? 'text-emerald-400' : 'text-red-400'}>{(debug?.artifacts?.ncu_rep || hasNcuRep) ? 'PASS' : 'FAIL'}</span>
+              </div>
+            </div>
+            <div className="space-y-1">
+              <div className="font-semibold">Context</div>
+              <div className="bg-zinc-950 border border-zinc-800 rounded p-2">
+                <div><span className="text-zinc-400">Kernel source:</span> <span className="font-mono">{debug?.kernels_source || 'none'}</span></div>
+                <div><span className="text-zinc-400">CSV reports:</span> {csvList && csvList.length>0 ? csvList.join(', ') : '—'}</div>
+                <div><span className="text-zinc-400">Counts:</span> <span className="font-mono">{JSON.stringify(debug?.counts || {}, null, 0)}</span></div>
+                {debug?.env?.is_wsl && <div className="mt-1 text-amber-400">WSL detected — NSYS often lacks kernel tables. Rely on NCU.</div>}
+              </div>
+              {Array.isArray(debug?.notes) && debug.notes.length>0 && (
+                <div className="bg-zinc-950 border border-zinc-800 rounded p-2">
+                  <div className="font-semibold mb-1">Notes</div>
+                  <ul className="list-disc pl-5 space-y-0.5">
+                    {debug.notes.map((n: string, i: number) => (<li key={i}>{n}</li>))}
+                  </ul>
+                </div>
+              )}
+              {!hasNcuRep && (
+                <div className="bg-zinc-950 border border-zinc-800 rounded p-2 text-zinc-300">
+                  Tip: enable GPU performance counters in Windows NVIDIA Control Panel → Developer → Manage GPU Performance Counters → Allow access to All Users, then re-run.
+                </div>
+              )}
+            </div>
           </div>
         </div>
       )}
