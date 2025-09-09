@@ -1,12 +1,22 @@
 # Cross-Layer Routing Bridges (XLRB) for Transformers
 
-This repo implements and evaluates **cross-layer communication mechanisms** on top of `roberta-large` for the GLUE RTE task. 
+This repo implements and evaluates **cross-layer communication mechanisms** on top of `roberta-large` for the GLUE RTE task. It provides a full-stack research platform with modular training, run orchestration, and GPU profiling built in. 
+
 We test two families of *bridges* — **QKV** (classical cross-attention across layers) and **HDIM** (higher-dimensional token–pair messages) — along with **hybrids** that combine both. 
 
-All runs are **deterministic**, with seeds fixed and PyTorch set to reproducible mode. Results are reported on RTE dev with no cherry-picking: every ablation, successful or collapsed, is logged.
+
+
+## System Architecture
+- Backend: FastAPI (REST API) + Celery worker, with Redis as broker/backend.
+- Training Core: PyTorch 2.x + Transformers (roberta-large), gradient checkpointing, clean config surface for ablations and overrides.
+- Database: SQLite for run metadata, epochs, and artifacts (paths + sizes).
+- Frontend: React + Vite + Tailwind dashboard for submitting runs, observing live progress, browsing artifacts, and inspecting profiling.
+- Profiling: Nsight Systems (timeline/CSV/SQLite) + Nsight Compute (kernels). Includes WSL-friendly kernel sanity tests and on-demand training-window profiling.
 
 > **Baseline:** plain `roberta-large` on RTE dev ≈ **86.6%**.  
 > **This repo:** HDIM-only H9 reaches **87.36%** (↑), hybrids A8 (**86.28%**) and A3 (**85.92%**) are competitive.
+
+All runs are **deterministic**, with seeds fixed and PyTorch set to reproducible mode. Results are reported on RTE dev with no cherry-picking: every ablation, successful or collapsed, is logged.
 
 ## Contents
 
@@ -235,6 +245,7 @@ Each script prints:
 - per-epoch train loss/EMA/acc  
 - validation accuracy/F1  
 - (hybrid metrics script) **live bridge usage**: QKV/HDIM norms, gate values, source histograms.
+
 
 
 
